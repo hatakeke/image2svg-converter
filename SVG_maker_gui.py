@@ -288,15 +288,27 @@ class ContourEditorApp:
             return
         self.h, self.w = self.image.shape[:2]
         
-        # 手動エッジリストをリセット
-        self.manual_edge_points = []
+        # すべての手書きデータと編集状態をリセット
+        self.manual_edge_points = []         # 手動エッジ点
+        self.manual_paths = []               # 手動パス
+        self.smoothed_paths = []             # スプライン補間パス
+        self.trace_points = []               # 現在の軌跡
+        self.undo_stack = []                 # アンドゥ履歴
+        self.redo_stack = []                 # リドゥ履歴
+        self.selected_edge = None            # 選択されたエッジ
+        self.drawing = False                 # 描画状態
         
+        # エッジ点とコントアも初期化
+        self.edge_points = []
+        self.contours = []
+        
+        # ビュー設定をリセット
         self.zoom_factor = 1.0
         self.min_zoom = 1.0
         self.view_xlim = (0, self.w)
         self.view_ylim = (self.h, 0)
         self.push_undo()
-        self.show_status(f"画像を読み込みました ({self.w}x{self.h})")
+        self.show_status(f"画像を読み込みました ({self.w}x{self.h}) - 手書きデータをクリアしました")
         self.update_edges()
 
     def update_edges(self):
@@ -325,7 +337,6 @@ class ContourEditorApp:
         for contour in self.contours:
             if len(contour) >= min_contour_points:
                 valid_contours.append(contour)
-                valid_contours.append(contour)
         
         self.show_status("処理中: エッジ点を抽出しています...")
         self.master.update_idletasks()
@@ -334,7 +345,6 @@ class ContourEditorApp:
         for contour in valid_contours:
             contour_points = contour[:, 0, :]
             for point in contour_points:
-                canny_edge_points.append((float(point[0]), float(point[1])))
                 canny_edge_points.append((float(point[0]), float(point[1])))
         
         # 元のCannyパスを保存（軌跡追跡との重複チェック用）
@@ -347,7 +357,6 @@ class ContourEditorApp:
                 path = [(float(point[0]), float(point[1])) for point in contour_points]
                 # 閉じたパスにする
                 if len(path) > 2:
-                    path.append(path[0])
                     path.append(path[0])
                 canny_paths.append(path)
         
@@ -510,11 +519,13 @@ class ContourEditorApp:
     def generate_spline_paths(self, contours):
         """スプライン補間を使用してCannyパスを滑らかにする"""
         smoothed_paths = []
+        min_contour_points = 10  # 最小輪郭点数を再定義
         
         for i, contour in enumerate(contours):
-            if len(contour) < 3:
+            # 長さフィルタリングを再チェック
+            if len(contour) < min_contour_points:
                 continue
-            
+                
             # 進行状況を表示
             if i % max(1, len(contours) // 10) == 0:
                 progress = int((i / len(contours)) * 100)
@@ -549,8 +560,11 @@ class ContourEditorApp:
                 smoothed_paths.append(fallback_path)
                 continue
         
-        # 手動パスも追加
-        smoothed_paths.extend(list(self.manual_paths))
+        # 手動パスも追加（長さフィルタリング適用）
+        min_contour_points = 10
+        for manual_path in self.manual_paths:
+            if len(manual_path) >= min_contour_points:
+                smoothed_paths.append(manual_path)
         
         self.show_status(f"スプライン補間完了: {len(smoothed_paths)}個のパスを生成")
         return smoothed_paths
@@ -960,6 +974,104 @@ class ContourEditorApp:
         
         return added_count
 
+    def simplify_trace_path(self, trace_points, tolerance=5.0):
+        """軌跡を適度に間引いて滑らかなパスにする（Douglas-Peucker風のアルゴリズム）"""
+        if len(trace_points) <= 2:
+            return trace_points
+        
+        def distance_point_to_line(point, line_start, line_end):
+            """点から直線までの距離を計算"""
+            x0, y0 = point
+            x1, y1 = line_start
+            x2, y2 = line_end
+            
+            # 直線の長さ
+            line_length = ((x2 - x1) ** 2 + (y2 - y1) ** 2) ** 0.5
+            if line_length == 0:
+                return ((x0 - x1) ** 2 + (y0 - y1) ** 2) ** 0.5
+            
+            # 点から直線への垂直距離
+            return abs((y2 - y1) * x0 - (x2 - x1) * y0 + x2 * y1 - y2 * x1) / line_length
+        
+        def simplify_recursive(points, start_idx, end_idx, tolerance):
+            """再帰的に点を間引く"""
+            if end_idx - start_idx <= 1:
+                return [start_idx, end_idx]
+            
+            max_distance = 0
+            max_idx = start_idx
+            
+            # 最も直線から離れた点を見つける
+            for i in range(start_idx + 1, end_idx):
+                distance = distance_point_to_line(points[i], points[start_idx], points[end_idx])
+                if distance > max_distance:
+                    max_distance = distance
+                    max_idx = i
+            
+            # 閾値を超える場合は分割して処理
+            if max_distance > tolerance:
+                left_result = simplify_recursive(points, start_idx, max_idx, tolerance)
+                right_result = simplify_recursive(points, max_idx, end_idx, tolerance)
+                return left_result[:-1] + right_result
+            else:
+                return [start_idx, end_idx]
+        
+        # 簡略化を実行
+        keep_indices = simplify_recursive(trace_points, 0, len(trace_points) - 1, tolerance)
+        simplified = [trace_points[i] for i in keep_indices]
+        
+        # 最低でも元の点数の1/3は残す
+        min_points = max(3, len(trace_points) // 3)
+        if len(simplified) < min_points:
+            # より多くの点を保持するために段階的に点を追加
+            step = len(trace_points) // min_points
+            simplified = [trace_points[i] for i in range(0, len(trace_points), step)]
+            if simplified[-1] != trace_points[-1]:
+                simplified.append(trace_points[-1])
+        
+        return simplified
+
+    def find_nearest_path_endpoint(self, target_point, max_distance=50):
+        """指定した点から最も近いパスの端点を見つける"""
+        if not self.smoothed_paths:
+            return None, None, None
+        
+        min_distance = float('inf')
+        nearest_path = None
+        nearest_endpoint = None
+        is_start_point = False
+        
+        for path_idx, path in enumerate(self.smoothed_paths):
+            if len(path) < 2:
+                continue
+            
+            # パスの開始点をチェック
+            start_point = path[0]
+            distance = ((target_point[0] - start_point[0]) ** 2 + 
+                       (target_point[1] - start_point[1]) ** 2) ** 0.5
+            
+            if distance < min_distance and distance <= max_distance:
+                min_distance = distance
+                nearest_path = path_idx
+                nearest_endpoint = start_point
+                is_start_point = True
+            
+            # パスの終了点をチェック
+            end_point = path[-1]
+            distance = ((target_point[0] - end_point[0]) ** 2 + 
+                       (target_point[1] - end_point[1]) ** 2) ** 0.5
+            
+            if distance < min_distance and distance <= max_distance:
+                min_distance = distance
+                nearest_path = path_idx
+                nearest_endpoint = end_point
+                is_start_point = False
+        
+        if nearest_path is not None:
+            return nearest_path, nearest_endpoint, is_start_point
+        else:
+            return None, None, None
+
     def remove_edges_in_mask(self, mask):
         """マスク領域内のエッジ点を削除する"""
         remaining_edges = []
@@ -985,6 +1097,115 @@ class ContourEditorApp:
         self.edge_points = remaining_edges
         self.manual_edge_points = remaining_manual_edges
         return removed_count
+
+    def remove_paths_in_mask(self, mask):
+        """マスク領域と交差するパスを部分削除する（改善版）"""
+        new_paths = []
+        new_manual_paths = []
+        removed_count = 0
+        
+        eraser_width = max(self.pen_size.get(), 5)
+        
+        for path in self.smoothed_paths:
+            if len(path) < 2:
+                continue
+            
+            # パスを消しゴム軌跡で分割
+            path_segments = self.split_path_by_mask(path, mask, eraser_width)
+            
+            if len(path_segments) == 1 and len(path_segments[0]) == len(path):
+                # パスが削除されなかった場合
+                new_paths.append(path)
+                if path in self.manual_paths:
+                    new_manual_paths.append(path)
+            elif len(path_segments) > 0:
+                # パスが分割された場合、各セグメントを新しいパスとして追加
+                min_contour_points = 10
+                for segment in path_segments:
+                    if len(segment) >= min_contour_points:  # 長さフィルタリング適用
+                        new_paths.append(segment)
+                        if path in self.manual_paths:
+                            new_manual_paths.append(segment)
+                removed_count += 1
+            else:
+                # パス全体が削除された場合
+                removed_count += 1
+        
+        self.smoothed_paths = new_paths
+        self.manual_paths = new_manual_paths
+        return removed_count
+
+    def split_path_by_mask(self, path, mask, eraser_width):
+        """パスをマスク領域で分割する"""
+        if len(path) < 2:
+            return [path]
+        
+        # パス上の各点がマスクと交差するかチェック
+        intersections = []
+        for i, point in enumerate(path):
+            is_intersecting = False
+            
+            # 点の周囲をチェック（消しゴムサイズを考慮）
+            for dx in range(-eraser_width//2, eraser_width//2 + 1):
+                for dy in range(-eraser_width//2, eraser_width//2 + 1):
+                    check_x = int(point[0] + dx)
+                    check_y = int(point[1] + dy)
+                    
+                    if 0 <= check_x < self.w and 0 <= check_y < self.h:
+                        if mask[check_y, check_x] > 0:
+                            is_intersecting = True
+                            break
+                if is_intersecting:
+                    break
+            
+            intersections.append(is_intersecting)
+        
+        # 連続する非交差部分を抽出してセグメントを作成
+        segments = []
+        current_segment = []
+        
+        for i, (point, is_intersecting) in enumerate(zip(path, intersections)):
+            if not is_intersecting:
+                current_segment.append(point)
+            else:
+                # 交差点に到達したので現在のセグメントを終了
+                if len(current_segment) >= 2:
+                    segments.append(current_segment)
+                current_segment = []
+        
+        # 最後のセグメントを追加
+        if len(current_segment) >= 2:
+            segments.append(current_segment)
+        
+        return segments
+
+    def apply_spline_to_path(self, path):
+        """パスにスプライン補間を適用する"""
+        if len(path) < 3:
+            return path
+        
+        try:
+            # パスを numpy 配列に変換
+            points = np.array(path)
+            x = points[:, 0].astype(float)
+            y = points[:, 1].astype(float)
+            
+            # スプライン補間を実行（開いた曲線として処理）
+            tck, u = splprep([x, y], s=1.0, per=False)  # per=False for open curves
+            
+            # より多くの点でスプライン曲線を再サンプリング
+            unew = np.linspace(0, 1.0, max(50, len(path) * 3))
+            out = splev(unew, tck)
+            spline_x, spline_y = out[0], out[1]
+            
+            # パスを生成（座標をタプルのリストに変換）
+            spline_path = [(float(sx), float(sy)) for sx, sy in zip(spline_x, spline_y)]
+            
+            return spline_path
+            
+        except Exception as e:
+            # スプライン補間に失敗した場合は元のパスをそのまま使用
+            return path
 
     def regenerate_paths_from_edges(self):
         """エッジ点からスプライン補間でパスを再生成（改善版）"""
@@ -1471,113 +1692,126 @@ class ContourEditorApp:
                 cv2.circle(mask, center, eraser_width, 1, -1)
             
             removed_count = self.remove_edges_in_mask(mask)
+            removed_paths = self.remove_paths_in_mask(mask)
             
-            new_paths = []
-            new_manual_paths = []
-            removed_paths = 0
-            
-            for path in self.smoothed_paths:
-                if len(path) < 1:
-                    continue
-                
-                path_intersects_mask = False
-                for px, py in path:
-                    px_int, py_int = int(px), int(py)
-                    if 0 <= px_int < self.w and 0 <= py_int < self.h:
-                        if mask[py_int, px_int] > 0:
-                            path_intersects_mask = True
-                            break
-                
-                if not path_intersects_mask:
-                    new_paths.append(path)
-                    if path in self.manual_paths:
-                        new_manual_paths.append(path)
-                else:
-                    removed_paths += 1
-            
-            self.smoothed_paths = new_paths
-            self.manual_paths = new_manual_paths
-            
-            if removed_count > 0:
-                self.regenerate_paths_from_edges()
-                self.show_status(f"消しゴム: {removed_count}個のエッジ点と{removed_paths}個のパスを削除し、パスを再生成しました")
-            else:
+            if removed_count > 0 and removed_paths > 0:
+                self.show_status(f"消しゴム: {removed_count}個のエッジ点と{removed_paths}個のパスを削除しました")
+            elif removed_count > 0:
+                self.show_status(f"消しゴム: {removed_count}個のエッジ点を削除しました")
+            elif removed_paths > 0:
                 self.show_status(f"消しゴム: {removed_paths}個のパスを削除しました")
+            else:
+                self.show_status("消しゴム: 削除対象のエッジ点またはパスが見つかりませんでした")
 
         elif mode == "pen":
-            if len(self.trace_points) == 1:
-                click_point = self.trace_points[0]
-                if click_point not in self.edge_points:
-                    self.edge_points.append(click_point)
-                    # 手動エッジリストにも追加
-                    if click_point not in self.manual_edge_points:
-                        self.manual_edge_points.append(click_point)
-                    self.regenerate_paths_from_edges()
-                    self.show_status("ペン: 1個のエッジ点を追加し、パスを再生成しました")
+            if len(self.trace_points) >= 2:
+                # 軌跡からパスを生成（エッジ点は追加せず、直接パスを作成）
+                new_path = list(self.trace_points)
+                
+                # 軌跡を適度に間引きして基本パスにする
+                simplified_path = self.simplify_trace_path(new_path)
+                
+                # スプライン補間を適用して滑らかなパスにする
+                smooth_path = self.apply_spline_to_path(simplified_path)
+                
+                # 長さフィルタリングを適用
+                min_contour_points = 10
+                if len(smooth_path) >= min_contour_points:
+                    # 手動パスとして追加
+                    self.manual_paths.append(smooth_path)
+                    self.smoothed_paths.append(smooth_path)
+                    
+                    self.show_status(f"ペン: {len(smooth_path)}点のスプライン補間パスを生成しました")
                 else:
-                    self.show_status("ペン: エッジ点は既に存在します")
-            
-            elif len(self.trace_points) >= 2:
-                start_point = self.trace_points[0]
-                end_point = self.trace_points[-1]
-                
-                added_count = 0
-                if start_point not in self.edge_points:
-                    self.edge_points.append(start_point)
-                    if start_point not in self.manual_edge_points:
-                        self.manual_edge_points.append(start_point)
-                    added_count += 1
-                if end_point not in self.edge_points:
-                    self.edge_points.append(end_point)
-                    if end_point not in self.manual_edge_points:
-                        self.manual_edge_points.append(end_point)
-                    added_count += 1
-                
-                intermediate_count = self.add_edge_points_along_line(start_point, end_point, self.trace_points)
-                
-                if added_count > 0 or intermediate_count > 0:
-                    self.regenerate_paths_from_edges()
-                    self.show_status(f"ペン: {intermediate_count}個のエッジ点を追加し、パスを再生成しました（始点・終点・中間点含む）")
-                else:
-                    self.show_status("ペン: 新しいエッジ点は追加されませんでした")
+                    self.show_status(f"ペン: パスが短すぎます（{len(smooth_path)}点 < {min_contour_points}点）。もっと長く描いてください")
+            else:
+                self.show_status("ペン: 軌跡が短すぎます。ドラッグして軌跡を描いてください")
 
         elif mode == "closing":
-            if len(self.trace_points) == 1:
-                click_point = self.trace_points[0]
-                nearest_edge = self.find_nearest_edge(click_point)
-                
-                if nearest_edge is None:
-                    self.show_status("クロージング: 近くにエッジ点が見つかりません")
-                elif self.selected_edge is None:
-                    self.selected_edge = nearest_edge
-                    self.show_status("クロージング: 最初のエッジ点を選択しました。2番目のエッジ点をクリックしてください")
-                else:
-                    if nearest_edge == self.selected_edge:
-                        self.show_status("クロージング: 同じエッジ点です。別のエッジ点をクリックしてください")
-                    else:
-                        new_path = [self.selected_edge, nearest_edge]
-                        self.manual_paths.append(new_path)
-                        self.smoothed_paths.append(new_path)
-                        self.show_status("クロージング: 2つのエッジ点をパスで接続しました")
-                        self.selected_edge = None
-            
-            elif len(self.trace_points) >= 2:
+            if len(self.trace_points) >= 2:
+                # 軌跡の始点と終点を取得
                 start_point = self.trace_points[0]
                 end_point = self.trace_points[-1]
                 
-                start_edge = self.find_nearest_edge(start_point)
-                end_edge = self.find_nearest_edge(end_point)
+                # 始点に最も近いパスの端点を検索
+                start_path_idx, start_endpoint, start_is_start = self.find_nearest_path_endpoint(start_point)
+                # 終点に最も近いパスの端点を検索
+                end_path_idx, end_endpoint, end_is_start = self.find_nearest_path_endpoint(end_point)
                 
-                if start_edge is None or end_edge is None:
-                    self.show_status("クロージング: 始点または終点の近くにエッジ点が見つかりません")
-                elif start_edge == end_edge:
-                    self.show_status("クロージング: 始点と終点が同じエッジ点を指しています")
+                if start_path_idx is None:
+                    self.show_status("クロージング: 始点の近くにパスの端点が見つかりません")
+                elif end_path_idx is None:
+                    self.show_status("クロージング: 終点の近くにパスの端点が見つかりません")
+                elif start_path_idx == end_path_idx and start_is_start == end_is_start:
+                    self.show_status("クロージング: 同じパスの同じ端点です。異なる端点を指定してください")
                 else:
-                    new_path = [start_edge, end_edge]
-                    self.manual_paths.append(new_path)
-                    self.smoothed_paths.append(new_path)
-                    self.show_status("クロージング: 2つのエッジ点をパスで接続しました")
-                    self.selected_edge = None
+                    # 2つのパスを接続
+                    if start_path_idx == end_path_idx:
+                        # 同じパスの両端を軌跡で接続（パスを閉じる）
+                        original_path = self.smoothed_paths[start_path_idx]
+                        
+                        if start_is_start and not end_is_start:
+                            # 開始点と終了点 → 軌跡で閉じる
+                            closed_path = original_path + list(self.trace_points)
+                        elif not start_is_start and end_is_start:
+                            # 終了点と開始点 → 軌跡を反転して閉じる
+                            closed_path = original_path + list(reversed(self.trace_points))
+                        else:
+                            # その他の場合はそのまま
+                            closed_path = original_path + list(self.trace_points)
+                        
+                        # 元のパスを削除し、新しい閉じたパスを追加
+                        del self.smoothed_paths[start_path_idx]
+                        if start_path_idx < len(self.manual_paths):
+                            del self.manual_paths[start_path_idx]
+                        
+                        # 長さフィルタリングを適用
+                        min_contour_points = 10
+                        if len(closed_path) >= min_contour_points:
+                            self.smoothed_paths.append(closed_path)
+                            self.manual_paths.append(closed_path)
+                            self.show_status(f"クロージング: パスを軌跡で閉じました（閉じたパス: {len(closed_path)}点）")
+                        else:
+                            self.show_status(f"クロージング: 閉じたパスが短すぎます（{len(closed_path)}点 < {min_contour_points}点）")
+                    else:
+                        # 異なるパスの接続（従来の処理）
+                        path1 = self.smoothed_paths[start_path_idx]
+                        path2 = self.smoothed_paths[end_path_idx]
+                        
+                        # パス1とパス2を結合（方向を考慮）
+                        if start_is_start and end_is_start:
+                            # 両方とも開始点 → path1を反転 + 軌跡 + path2
+                            combined_path = list(reversed(path1)) + list(self.trace_points) + path2
+                        elif start_is_start and not end_is_start:
+                            # start=開始点, end=終了点 → path1を反転 + 軌跡 + path2を反転
+                            combined_path = list(reversed(path1)) + list(self.trace_points) + list(reversed(path2))
+                        elif not start_is_start and end_is_start:
+                            # start=終了点, end=開始点 → path1 + 軌跡 + path2
+                            combined_path = path1 + list(self.trace_points) + path2
+                        else:
+                            # 両方とも終了点 → path1 + 軌跡 + path2を反転
+                            combined_path = path1 + list(self.trace_points) + list(reversed(path2))
+                        
+                        # 元のパスを削除し、新しい結合パスを追加
+                        removed_paths = [self.smoothed_paths[start_path_idx], self.smoothed_paths[end_path_idx]]
+                        
+                        # インデックスの大きい方から削除（インデックスずれを防ぐ）
+                        indices_to_remove = sorted([start_path_idx, end_path_idx], reverse=True)
+                        for idx in indices_to_remove:
+                            del self.smoothed_paths[idx]
+                            if idx < len(self.manual_paths) and self.manual_paths[idx] in removed_paths:
+                                del self.manual_paths[idx]
+                        
+                        # 新しい結合パスを追加
+                        min_contour_points = 10
+                        if len(combined_path) >= min_contour_points:
+                            self.smoothed_paths.append(combined_path)
+                            self.manual_paths.append(combined_path)
+                            self.show_status(f"クロージング: 2つのパスを軌跡で接続しました（結合パス: {len(combined_path)}点）")
+                        else:
+                            self.show_status(f"クロージング: 結合パスが短すぎます（{len(combined_path)}点 < {min_contour_points}点）")
+            else:
+                self.show_status("クロージング: 軌跡が短すぎます。ドラッグして2つのパス端点を繋いでください")
 
         self.drawing = False
         self.trace_points = []
